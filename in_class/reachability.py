@@ -1,5 +1,8 @@
 import numpy as np
 import copy
+from scipy.optimize import linprog
+
+
 
 class HyperBox(object):
     """
@@ -436,9 +439,255 @@ class Star(object):
     A Star class for reachability
     """
 
-    # fill your code here
-    pass
+    def __init__(self, c , V , C = None, d_vec = None, lb = None, ub = None):
+        if V.ndim == 1:
+            V = V.reshape(-1, 1)
+        
+        assert isinstance(c, np.ndarray), "c must be a numpy array"
+        assert isinstance(V, np.ndarray), "V must be a numpy array"
+        assert c.shape[0] == V.shape[0], \
+            f"c (dim {c.shape[0]}) and V (rows {V.shape[0]}) must share dimension d"
+        
+        d, m = V.shape
+        self.c = c
+        self.V = V
+        self.dim = d
+        self.m = m #number of predicates
+
+        if C is None:
+            self.C = np.zeros((0, m))
+            self.d_vec = np.zeros(0)
+        
+        else:
+            self.C = C
+            self.d_vec = d_vec
+        
+        if lb is None:
+            self.lb = np.full(m, -np.inf)
+        else:
+            self.lb = lb
+        
+        if ub is None:
+            self.ub = np.full(m, np.inf)
+        else:
+            self.ub = ub
     
+    def __str__(self):
+        print(f'Star (dim={self.dim}, generators={self.m}):')
+        print(f'  center c    = {self.c}')
+        print(f'  generator V =\n{self.V}')
+        print(f'  predicate C =\n{self.C}')
+        print(f'  predicate d = {self.d_vec}')
+        print(f'  alpha lb    = {self.lb}')
+        print(f'  alpha ub    = {self.ub}')
+
+    @staticmethod
+    def from_box(lb_x, ub_x):
+
+        assert isinstance(lb_x, np.ndarray), "lb_x must be a numpy array"
+        assert isinstance(ub_x, np.ndarray), "lb_ub_xx must be a numpy array"
+
+        c       = (lb_x + ub_x) / 2.0
+        V       = np.diag((ub_x - lb_x) / 2.0)
+        lb_alpha = np.full(len(lb_x), -1.0)
+        ub_alpha = np.full(len(ub_x),  1.0)
+        return Star(c, V, lb=lb_alpha, ub=ub_alpha)
+
+    def affineMap(self, W, b):
+        assert isinstance(W, np.ndarray), "W must be a numpy array"
+        assert isinstance(b, np.ndarray), "b must be a numpy array"
+
+        new_c = W @ self.c + b
+        new_V = W @ self.V
+
+        return Star(new_c, new_V,
+                    C = self.C.copy() if self.C.shape[0] > 0 else None,
+                    d_vec = self.d_vec.copy() if self.C.shape[0] > 0 else None,
+                    lb = self.lb.copy(), ub=self.ub.copy())
+
+    def intersect(self, G, g):
+        """
+        Intersect Star with halfspaces
+        phi ∩ H  =  <c, V, P and P_H>
+            where P_H(alpha) = (G*V)*alpha <= g - G*c
+        """
+        assert isinstance(G, np.ndarray), "G must be a numpy array"
+        assert isinstance(g, np.ndarray), "g must be a numpy array"
+
+        C_new = G @ self.V
+        d_new = g - G @ self.c
+
+        if self.C.shape[0] > 0:
+            C_combined = np.vstack([self.C, C_new])
+            d_combined = np.concatenate([self.d_vec, d_new])
+        
+        else:
+            C_combined = C_new
+            d_combined = d_new
+        
+        return Star(self.c.copy(), self.V.copy(),
+                    C = C_combined, d_vec = d_combined,
+                    lb = self.lb.copy(), ub = self.ub.copy()) 
+    
+    def getEstimatedBounds(self):
+        """
+        Over-approximate Star bounds using predicate
+        """
+
+        # Clap infinite to finite values
+        lb_a = np.where(np.isfinite(self.lb), self.lb, -1.0)
+        ub_a = np.where(np.isfinite(self.ub), self.ub,  1.0)
+
+        V_pos = np.maximum(self.V, 0.0)
+        V_neg = np.minimum(self.V, 0.0)
+
+        lb_x = self.c + V_pos @ lb_a + V_neg @ ub_a
+        ub_x = self.c + V_pos @ ub_a + V_neg @ lb_a
+
+        return lb_x, ub_x
+    
+    def getExactBound(self):
+        """
+        Exact bound of Star through Linear compute
+        Returns:
+            (lb, ub): exact lower and upper bound vectors, each shape (d,)
+
+        """
+        d, m = self.dim, self.m
+        lb_x, ub_x = np.zeros(d), np.zeros(d)
+
+        # Build bound tuple for linprog
+        alpha_bounds = list(zip(
+            np.where(np.isfinite(self.lb), self.lb, -1e9),
+            np.where(np.isfinite(self.ub), self.ub,  1e9)
+        ))
+
+        # Constraints
+        A_ub = self.C if self.C.shape[0] > 0 else None
+        b_ub = self.d_vec if self.C.shape[0] > 0 else None
+
+        for j in range(d):
+            c_obj = self.V[j, :] # obj coefficients
+ 
+            # Minimise
+            res_min = linprog(c_obj, A_ub=A_ub, b_ub=b_ub,
+                              bounds=alpha_bounds, method='highs')
+            lb_x[j] = self.c[j] + res_min.fun if res_min.success else -np.inf
+ 
+            # Maximise  (negate obj)
+            res_max = linprog(-c_obj, A_ub=A_ub, b_ub=b_ub,
+                              bounds=alpha_bounds, method='highs')
+            ub_x[j] = self.c[j] - res_max.fun if res_max.success else np.inf
+ 
+        return lb_x, ub_x
+    
+    def stepReLU(self, idx):
+        """
+        Apply ReLU to a neuron 
+        When:
+            1. All active : star unchanged
+            2. All inactive: generate new Star to 0 | predicate unchanged
+            3. crossing: Split Star w/ halfspace
+        """
+
+        lb_arr, ub_arr = self.getExactBound()
+        l_i, u_i = lb_arr[idx], ub_arr[idx]
+
+        if l_i >= 0.0:
+            return [self]
+
+        elif u_i <= 0.0:
+            new_c = self.c.copy()
+            new_c[idx] = 0.0
+            new_V = self.V.copy()
+            new_V[idx, :] = 0.0
+            C_arg = self.C     if self.C.shape[0] > 0 else None
+            d_arg = self.d_vec if self.C.shape[0] > 0 else None
+
+            return [Star(new_c, new_V,
+                        C = C_arg, d_vec = d_arg,
+                         lb = self.lb.copy(), ub = self.ub.copy())]
+
+        else:
+            e_i = np.zeros((1, self.dim))
+            e_i[0, idx] = 1.0
+            # Active branch
+            star_active = self.intersect(-e_i, np.array([0.0]))
+
+            # inactive branch
+            star_inactive = self.intersect(e_i, np.array([0.0]))
+
+            # Zero dimension idx
+            new_c = star_inactive.c.copy()
+            new_c[idx] = 0.0
+            new_V = star_inactive.V.copy()
+            new_V[idx, :] = 0.0
+            C_arg = star_inactive.C     if star_inactive.C.shape[0] > 0 else None
+            d_arg = star_inactive.d_vec if star_inactive.C.shape[0] > 0 else None
+            star_inactive = Star(new_c, new_V, C = C_arg, d_vec = d_arg,
+                                 lb = star_inactive.lb.copy(),
+                                 ub = star_inactive.ub.copy())
+            return [star_active, star_inactive]
+        
+    def ReLU(self):
+            """
+            Exact ReLU on Star w/ stepReLU d by d
+            """
+
+            current_stars = [self]
+
+            for i in range(self.dim):
+                next_stars = []
+                for s in current_stars:
+                    next_stars.extend(s.stepReLU(i))
+                current_stars = next_stars
+ 
+            return current_stars
+
+    @staticmethod
+    def propagate(input_star, network):
+        """
+        Exact Star propagation through a network 
+ 
+        """
+        reach_sets = [[input_star]]
+        current_stars = [input_star]
+ 
+        for op in network:
+            next_stars = []
+ 
+            if op.operationType == 'affineMap':
+                W, b = op.operationPara
+                for s in current_stars:
+                    next_stars.append(s.affineMap(W, b))
+ 
+            elif op.operationType in ('relu', 'ReLU'):
+                for s in current_stars:
+                    next_stars.extend(s.ReLU())
+ 
+            else:
+                raise ValueError(f"Unknown operation type: {op.operationType}")
+ 
+            current_stars = next_stars
+            reach_sets.append(current_stars)
+ 
+        return reach_sets
+
+    @staticmethod
+    def getOutputBound(star_list):
+        """
+        Compute exact lb/ub over a list of Stars.
+ 
+        """
+        all_lb = []
+        all_ub = []
+        for s in star_list:
+            lb_s, ub_s = s.getExactBound()
+            all_lb.append(lb_s)
+            all_ub.append(ub_s)
+
+        return np.min(np.stack(all_lb), axis=0), np.max(np.stack(all_ub), axis=0)
+
 class Operation(object):
     """
     Neural network as a set/graph of operations
@@ -927,6 +1176,101 @@ class Test(object):
         else:
             print('Test Successfull!')
 
+    ###
+    ### STAR TESTS
+    ###
+
+    def test_Star_constructor(self):
+        self.n_tests += 1
+        print('\nTesting Star constructor (from_box)...')
+        try:
+            lb = np.array([0.0, -1.0])
+            ub = np.array([1.0,  1.0])
+            S  = Star.from_box(lb, ub)
+            S.__str__()
+            assert S.dim == 2
+            assert S.m   == 2
+            # center should be [0.5, 0.0], V = diag([0.5, 1.0])
+            assert np.allclose(S.c, [0.5, 0.0]),     f'center wrong: {S.c}'
+            assert np.allclose(S.V, np.diag([0.5, 1.0])), f'V wrong: {S.V}'
+        except Exception as e:
+            print(f'Test Fail! ({e})')
+            self.n_fails += 1
+        else:
+            print('Test Successfull!')
+ 
+    def test_Star_affineMap(self):
+        self.n_tests += 1
+        print('\nTesting Star affineMap...')
+        try:
+            lb = np.array([0.0, -1.0])
+            ub = np.array([1.0,  1.0])
+            S  = Star.from_box(lb, ub)
+            
+            W  = np.array([[1.0, -1.0], [-1.0, 1.0], [1.0, -2.0]])
+            b  = np.array([0., 0., 0.])
+            S1 = S.affineMap(W, b)
+            assert S1.dim == 3, f'expected dim=3, got {S1.dim}'
+            assert S1.m   == 2, f'expected m=2,   got {S1.m}'
+            # Predicate unchanged
+            
+            assert S1.C.shape == S.C.shape
+            lb_e, ub_e = S1.getExactBound()
+            print(f'  after affineMap1: lb={lb_e}, ub={ub_e}')
+        except Exception as e:
+            print(f'Test Fail! ({e})')
+            self.n_fails += 1
+        else:
+            print('Test Successfull!')
+ 
+    def test_Star_stepReLU(self):
+        self.n_tests += 1
+        print('\nTesting Star stepReLU...')
+        try:
+            lb = np.array([0.0, -1.0])
+            ub = np.array([1.0,  1.0])
+            S  = Star.from_box(lb, ub)
+            W  = np.array([[1.0, -1.0], [-1.0, 1.0], [1.0, -2.0]])
+            b  = np.array([0., 0., 0.])
+            S1 = S.affineMap(W, b)
+ 
+            # dim 0: lb=-1, ub=2 → crossing → should split into 2
+            result = S1.stepReLU(0)
+            print(f'  stepReLU(dim=0): {len(result)} star(s) returned')
+            assert len(result) in (1, 2), f'unexpected count: {len(result)}'
+        except Exception as e:
+            print(f'Test Fail! ({e})')
+            self.n_fails += 1
+        else:
+            print('Test Successfull!')
+ 
+    def test_Star_ReLU(self):
+        self.n_tests += 1
+        print('\nTesting Star ReLU...')
+        try:
+            lb = np.array([0.0, -1.0])
+            ub = np.array([1.0,  1.0])
+            S  = Star.from_box(lb, ub)
+            W  = np.array([[1.0, -1.0], [-1.0, 1.0], [1.0, -2.0]])
+            b  = np.array([0., 0., 0.])
+            S1 = S.affineMap(W, b)
+ 
+            stars_out = S1.ReLU()
+            print(f'  ReLU produced {len(stars_out)} star(s)')
+ 
+            # Compute union bounds
+            lb_out, ub_out = Star.getOutputBound(stars_out)
+            print(f'  union lb = {lb_out}')
+            print(f'  union ub = {ub_out}')
+            assert np.all(lb_out >= -1e-9), 'lb negative after ReLU'
+            assert np.all(ub_out >= -1e-9), 'ub negative after ReLU'
+        except Exception as e:
+            print(f'Test Fail! ({e})')
+            self.n_fails += 1
+        else:
+            print('Test Successfull!')
+
+
     def test_example_network(self):
         self.n_tests += 1
         print('\nTesting Problem 1 Part 4...')
@@ -976,14 +1320,28 @@ class Test(object):
                 print('  {}: lb = {}, ub = {}, generators = {}'.format(
                     op.operationName, z_lb, z_ub, Z0_reach[i+1].n_gen))
             
+            ST0       = Star.from_box(lb, ub)
+            ST_reach  = Star.propagate(ST0, network)
+            print('\n  Exact Star reachable sets:')
+            for i, op in enumerate(network):
+                stars = ST_reach[i+1]
+                lb_s, ub_s = Star.getOutputBound(stars)
+                print('  {}: lb = {}, ub = {}, |stars| = {}'.format(
+                    op.operationName, lb_s, ub_s, len(stars)))
+            
+
+            
             # Get CB of the output neuron
             B0_lb, B0_ub = B0_reach[-1].lb, B0_reach[-1].ub
             S0_lb, S0_ub = S0_reach[-1].getConcreteBound()
             Z0_lb, Z0_ub = Z0_reach[-1].getConcreteBound()
+            ST_lb, ST_ub   = Star.getOutputBound(ST_reach[-1])
 
             print(f"\n\n- HYPER RECTANGLE: [{B0_lb}, {B0_ub}]")
             print(f"- SYMBOLIC BOUND: [{S0_lb}, {S0_ub}]")
             print(f"- ZONOTOPE: [{Z0_lb}, {Z0_ub}]")
+            print(f'  EXACT STAR: [{ST_lb}, {ST_ub}]')
+
 
         except Exception as e:
             print(f'Test Fail! ({e})')
@@ -1021,8 +1379,14 @@ if __name__ == "__main__":
     test.test_Zonotope_affineMap()
     test.test_Zonotope_ReLU()
     test.test_Zonotope_propagate()
-    """
+    
 
+    print('\n=== STAR UNIT TESTS ===')
+    test.test_Star_constructor()
+    test.test_Star_affineMap()
+    test.test_Star_stepReLU()
+    test.test_Star_ReLU()
+    """
     test.test_example_network()
     """ OUTPUTs:
 
